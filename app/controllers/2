@@ -1,0 +1,14 @@
+class MainController < ApplicationController
+
+  def create_new_message
+    puts "Hit Create New Message"
+  end
+
+  def get_chat_by_id
+    puts "Hit get chat by id"
+  end
+
+  def get_chats_by_username
+    puts "Hit get chats by username
+  end
+end
