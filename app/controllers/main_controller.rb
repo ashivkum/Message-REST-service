@@ -1,6 +1,11 @@
+require 'thread'
+
 class MainController < ApplicationController
 
   @@message_id = 0
+
+  # This lock is provided to make the post operation including the ID threadsafe
+  @@lock = Mutex.new
 
   # Implementing hot/cold storage system using 2 different arrays
   # Ideally this should be done with a database, but for simplicity using this
@@ -23,11 +28,12 @@ class MainController < ApplicationController
     timeout = (params[:timeout].present?) ? to_minutes(params[:timeout].to_i) : to_minutes(60)
 
     # Setup the chat to add to the list based on params
-    input_chat = {}
-    input_chat[:username] = params[:username]
-    input_chat[:text] = params[:text]
-    input_chat[:timeout] = Time.now + timeout
-    @@message_id += 1
+    input_chat = { :username => params[:username], :text => params[:text], :timeout => Time.now + timeout }
+    
+    # Using Mutex makes this threadsafe
+    @@lock.synchronize do
+      @@message_id += 1
+    end
     input_chat[:id] = @@message_id.to_s
 
     # Add to the list of unexpired chats.  This service does not expire chats on its own, but requires
