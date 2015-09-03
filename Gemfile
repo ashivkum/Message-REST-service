@@ -23,6 +23,9 @@ gem 'jbuilder', '~> 2.0'
 # bundle exec rake doc:rails generates the API under doc/api.
 gem 'sdoc', '~> 0.4.0', group: :doc
 
+# Firebase
+gem 'firebase', '~> 0.2.4'
+
 # RSpec to test
 group :development, :test do
   gem 'rspec-rails', '~> 3.0'

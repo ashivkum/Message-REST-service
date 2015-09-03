@@ -1,4 +1,6 @@
 require 'thread'
+require 'pry'
+require 'firebase'
 
 class MainController < ApplicationController
 
@@ -7,13 +9,14 @@ class MainController < ApplicationController
   # This lock is provided to make the post operation including the ID threadsafe
   @@lock = Mutex.new
 
-  # Implementing hot/cold storage system using 2 different arrays
-  # Ideally this should be done with a database, but for simplicity using this
-  # So long as the file is not modified upon building, executing, and testing this service, the current setup will work
-  @@unexpired_chats = []
-  @@expired_chats = []
-
+  # This is the root defalt object we use in order to maintain our "table".  Firebase is finicky when it comes
+  # to its structure and each "table" must contain at least one element, or else the table itself gets deleted
+  # Set the timeout arbitrarily long from now so that it never expires, and remains in this "table"
+  DEFAULT_VALUE = { :root => { :id => -1, :timeout => Time.now + 30.years, :text => "", :username => "" }}
   def initialize
+    # Firebase client for querying database service
+    # Ideally pull the url from a config file
+    @client = Firebase::Client.new('https://mfp-chat-dev.firebaseio.com')
   end
 
   def create_new_message
@@ -25,7 +28,7 @@ class MainController < ApplicationController
     end
 
     # Set the timeout based on whether user has put it in or not in the request
-    timeout = (params[:timeout].present?) ? to_minutes(params[:timeout].to_i) : to_minutes(60)
+    timeout = (params[:timeout].present?) ? (params[:timeout].to_i).minutes : 60.minutes
 
     # Setup the chat to add to the list based on params
     input_chat = { :username => params[:username], :text => params[:text], :timeout => Time.now + timeout }
@@ -38,9 +41,9 @@ class MainController < ApplicationController
 
     # Add to the list of unexpired chats.  This service does not expire chats on its own, but requires
     # a GET request from the client to move the chat to the necessary list
-    @@unexpired_chats << input_chat
-    render :json => { :id => @@message_id }, :status => 201
-
+    if post_to_firebase(input_chat) == true
+      render :json => { :id => @@message_id }, :status => 201
+    end
   end
 
   def get_chat_by_id
@@ -54,17 +57,24 @@ class MainController < ApplicationController
     # Build a list of chats (should only be 1, but the spec was odd about this)
     response_list = []
 
-    # This can enumarate through both expired and unexpired chats
-    all_chats = @@unexpired_chats | @@expired_chats
-    all_chats.each {
-      |chat|
-      response_list << chat if chat[:id] == params[:id]
-    }
-    if response_list.empty?
+    expired_chats = @client.get("expired-chats/#{params[:id]}")
+    unexpired_chats = @client.get ("unexpired-chats/#{params[:id]}")
+
+    if expired_chats.nil? || unexpired_chats.nil?
+      render :json => { :message => "Error querying upstream database", :status => 500 }, :status => 500
+      return
+    end
+
+    # Since we have a successful response, now can get required fields
+    # Chat IDs can be unique, so only one possible response
+    expired_chats = expired_chats.body
+    unexpired_chats = unexpired_chats.body
+
+    if expired_chats.nil? && unexpired_chats.nil?
       render :json => { :message => "Cannot find chat with id: '#{params[:id]}'", :status => 404 }, :status => 404
       return
     else
-      render :json => response_list, :status => 200
+      render :json => (expired_chats.nil? ? unexpired_chats : expired_chats), :status => 200
       return
     end
   end
@@ -77,39 +87,60 @@ class MainController < ApplicationController
       return
     end
 
+    unexpired_chats = @client.get("unexpired-chats")
+
+    if unexpired_chats.nil?
+      render :json => { :message => "Error querying upstream database.", :status => 500 }, :status => 500
+      return
+    end
+
+    unexpired_chats = unexpired_chats.body.nil? ? [] : unexpired_chats.body
+
     # One is presented as a response list to user, the other is used to compute deletes from unexpired list
     # Concurrent modification is a nasty little thing
     response_list = []
-    to_delete = []
-    @@unexpired_chats.each {
-      |chat|
+    deletions = {}
+
+    unexpired_chats.each {
+      |key, chat|
+      # Again, to symbolize the keys to keep logic consistent
+      chat.symbolize_keys! if chat.class == Hash
+
       # Freezing the time now so that the following two operations depend on the same time
       curr_time = Time.now
-      response_list << { :id => chat[:id], :text => chat[:text] } if (chat[:username] == params[:username] && chat[:timeout] >= curr_time)
-      to_delete << chat if (chat[:username] == params[:username] || chat[:timeout] < curr_time)
+
+      chat_timeout = Time.parse(chat[:timeout])
+      response_list << { :id => chat[:id], :text => chat[:text] } if (chat[:username] == params[:username] && chat_timeout >= curr_time)
+      deletions[key] = chat if (chat[:username] == params[:username] || chat_timeout < curr_time)
     }
 
-    # This loop is done again because concurrently deleting from unexpired chats in the previous loop results in unpredictable behaviour
-    to_delete.each {
-      |chat|
-      @@unexpired_chats.delete(chat)
-      @@expired_chats << chat
+    # Faster performance to render and then perform DB operations
+    render :json => response_list
+
+
+    # Instead of deleting all of the elements from table, set it to default value is easier
+    delete_unexpired = @client.set("unexpired-chats", DEFAULT_VALUE)
+    if delete_unexpired.nil?
+      render :json => { :message => "Error querying upstream database.", :status => 500 }, :status => 500
+      return
+    end
+
+    # Sets all of the deletions from unexpired list to expired
+    deletions.each {
+      |key, value|
+      push_expire = @client.set("expired-chats/#{key}", value)
+      if push_expire.nil?
+        render :json => { :message => "Error querying upstream database.", :status => 500 }, :status => 500
+        return
+      end
     }
-    render :json => response_list, :status => 200
   end
 
-  # The following public methods are for testing
-  def get_expired_chats
-    return @@expired_chats
-  end
-
-  def get_unexpired_chats
-    return @@unexpired_chats
-  end
-
-  # Private utility method used above
+  # Private utility methods used above
   private
-  def to_minutes(input)
-    return input * 60
+
+  def post_to_firebase(input)
+    response = @client.set("unexpired-chats/#{input[:id]}", input)
+    return response.success?
   end
 end
